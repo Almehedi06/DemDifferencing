@@ -5,9 +5,8 @@ Never edit the copy in Downloads by hand: change the sources below and rebuild.
     python experiments/bin/build_pioneer_eval.py
 
 Sources:
-    experiments/pioneer_eval/            __init__.py and README.txt
-    experiments/bin/auc_experiment.py    the scoring
-    ~/landlab-grid-validation/src/landlab_grid_validation   the package, copied in
+    experiments/pioneer_eval/            __init__.py (the Pioneer settings) and README.txt
+    ~/landlab-grid-validation/src/landlab_grid_validation   the scoring package, copied in
     the Pioneer data folder              points, corrected dDEM, model DEM
 """
 from __future__ import annotations
@@ -22,7 +21,6 @@ PIONEER = Path("/mnt/c/Users/amehedi/Downloads/pioneer")
 SOURCES = {
     "__init__.py": HERE.parent / "pioneer_eval" / "__init__.py",
     "README.txt": HERE.parent / "pioneer_eval" / "README.txt",
-    "auc_experiment.py": HERE / "auc_experiment.py",
 }
 PACKAGE = Path.home() / "landlab-grid-validation" / "src" / "landlab_grid_validation"
 DATA = [PIONEER / "obs_data" / f"Initiation_Points_final.{ext}"

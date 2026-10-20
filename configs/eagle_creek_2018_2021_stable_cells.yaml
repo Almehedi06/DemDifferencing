@@ -1,0 +1,50 @@
+batch:
+  name: eagle_creek_2018_2021
+  pre_dir: /mnt/c/Users/amehedi/Downloads/eagle_creek/NonDensFilt/2018_2021/Final Pre
+  post_dir: /mnt/c/Users/amehedi/Downloads/eagle_creek/NonDensFilt/2018_2021/Final Post
+  pre_glob: "*_Pre.tif"
+  post_glob: "*_Post.tif"
+  pre_id_regex: "^(?P<id>.+)_Pre\\.tif$"
+  post_id_regex: "^(?P<id>.+)_Post\\.tif$"
+  pair_ids: null
+  output_dir: /mnt/c/Users/amehedi/Downloads/eagle_creek/stable_cells
+  mask_dirname: masks
+
+processing:
+  reference: pre
+  require_same_grid: true
+  reproject_post_to_pre: false
+  continue_on_error: true
+  overwrite: false
+
+terrain:
+  # compute_dinf computes G from each pre-event DEM:
+  # fill depressions -> slope percent -> D-infinity SCA -> G = a * S^alpha.
+  # Use "raster" only when matching G rasters already exist.
+  g_source: compute_dinf
+  alpha: 1.167
+  keep_intermediates: true
+  g_dir: null
+  g_template: "{id}_G.tif"
+
+stable_cells:
+  # Initial tested rule: high-elevation, low-G ridge/divide proxy.
+  # Do not use G alone in lowlands; elev_min excludes likely valley-floor/floodplain deposition.
+  g_min: null
+  g_max: 5.0
+  elev_min: 600.0
+  elev_max: null
+  slope_min: null
+  slope_max: null
+
+  # Optional raw dDEM screen. Leave null for pure terrain-based stable cells.
+  # Set, for example, 5.0 to mimic the older |post-pre| < 5 m screen.
+  dh_abs_max: null
+
+  stable_value: 1
+  unstable_value: 0
+  nodata_value: 255
+
+quality:
+  min_stable_pixels: 1000
+  min_stable_fraction: 0.01

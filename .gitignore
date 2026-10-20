@@ -1,0 +1,30 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environments and credentials
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Local inputs and generated runs (see configs/event.example.yaml)
+/data/
+/outputs/
+/Production_o1_a90_ASPECT/
+/evaluation/
+
+# Preserve the documented benchmark PNGs and CSVs in experiments/archive/.
+# Ignore new results by output directory, not by their file extension.
+
+# Operating system metadata
+.DS_Store
+Thumbs.db

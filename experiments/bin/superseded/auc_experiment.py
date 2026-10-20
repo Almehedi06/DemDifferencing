@@ -8,7 +8,7 @@ random away from the initiation points and outside what the event changed.
 Each run writes its own folder, output_dir/run_name:
 
   metrics.csv       AUC with a 95% interval and success-rate scores, per layer and type
-  roc_success.png   ROC and success-rate curves
+  roc.png           one ROC curve panel per observation type
   roc_curves.csv    the ROC curves as numbers, for plotting elsewhere
   negatives.gpkg    the absence cells used, with their G, slope and dDEM
   config.yaml       this run's settings, copied
@@ -147,31 +147,35 @@ def sha256(path, chunk=1 << 22):
 
 
 def figure(curves, types, layers, n_points, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """One ROC panel per observation type (true-positive rate against false-positive
+    rate), up to three panels per row. The success-rate curve is not drawn: with
+    absence cells making up nearly the whole domain it repeats the ROC; its area is
+    still in metrics.csv.
 
-    fig, axes = plt.subplots(len(types), 2, figsize=(10, 4.2 * len(types)), constrained_layout=True,
-                             squeeze=False)
-    for row, code in enumerate(types):
-        for col, (kind, xlabel) in enumerate([("roc", "share of absence cells flagged"),
-                                              ("sr", "share of domain area flagged")]):
-            ax = axes[row, col]
-            ax.plot([0, 1], [0, 1], "--", color="#8a8a85", lw=1)
-            for colour, layer in zip(COLOURS, layers):
-                x, y, value = curves[(code, layer, kind)]
-                ax.plot(x, y, color=colour, lw=2, label=f"{layer}  ({value:.2f})")
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1.02)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("share of initiation cells flagged")
-            name = "ROC curve (AUC)" if kind == "roc" else "success-rate curve (area under it)"
-            ax.set_title(f"{code}, {n_points[code]} points: {name}", loc="left", fontsize=10)
-            ax.legend(loc="lower right", fontsize=8, frameon=False)
-            ax.grid(color="#e6e6e3", lw=0.8)
-            ax.spines[["top", "right"]].set_visible(False)
+    Built with Figure directly, not pyplot: this runs inside notebooks, and switching
+    the backend or leaving a pyplot figure open would stop the notebook's later plots."""
+    from matplotlib.figure import Figure
+
+    ncols = min(3, len(types))
+    nrows = -(-len(types) // ncols)
+    fig = Figure(figsize=(4.8 * ncols, 4.4 * nrows), constrained_layout=True)
+    axes = fig.subplots(nrows, ncols, squeeze=False)
+    for ax in axes.ravel()[len(types):]:
+        ax.set_visible(False)
+    for ax, code in zip(axes.ravel(), types):
+        ax.plot([0, 1], [0, 1], "--", color="#8a8a85", lw=1)
+        for colour, layer in zip(COLOURS, layers):
+            x, y, value = curves[(code, layer, "roc")]
+            ax.plot(x, y, color=colour, lw=2, label=f"{layer}  (AUC {value:.2f})")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.set_xlabel("false-positive rate (share of absence cells flagged)")
+        ax.set_ylabel("true-positive rate (share of initiation cells flagged)")
+        ax.set_title(f"{code}, {n_points[code]} points", loc="left", fontsize=10)
+        ax.legend(loc="lower right", fontsize=8, frameon=False)
+        ax.grid(color="#e6e6e3", lw=0.8)
+        ax.spines[["top", "right"]].set_visible(False)
     fig.savefig(path, dpi=150)
-    plt.close(fig)
 
 
 def main(argv=None):
@@ -301,7 +305,7 @@ def main(argv=None):
         writer = csv.DictWriter(f, fieldnames=list(results[0]))
         writer.writeheader()
         writer.writerows(results)
-    figure(curves, types, layer_names, n_points, out / "roc_success.png")
+    figure(curves, types, layer_names, n_points, out / "roc.png")
     with open(out / "roc_curves.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["type", "layer", "auc", "fpr", "tpr"])

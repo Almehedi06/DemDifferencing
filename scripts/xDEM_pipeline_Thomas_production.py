@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import geoutils as gu
+import json
 
 
 # ===================================================
@@ -77,12 +78,40 @@ class CoregBiasPipeline:
         directional_angle=90,
         stable_dh_threshold=5.0,
         map_clim=1.0,
+        stable_mask_path=None,
+        stable_value=1,
+        min_stable_pixels=1000,
+        min_stable_fraction=0.01,
+        correction_preset="montecito",
+        fit_land_cover=None,
+        fit_land_cover_classes=(31, 71),
+        lod_method="none",
+        lod_quantile=0.95,
+        validation_block_size_m=250.0,
     ):
         self.reference_label = reference_label
         self.deramp_order = deramp_order
         self.directional_angle = directional_angle
         self.stable_dh_threshold = stable_dh_threshold
         self.map_clim = map_clim
+        self.stable_mask_path = stable_mask_path
+        self.stable_value = stable_value
+        self.min_stable_pixels = min_stable_pixels
+        self.min_stable_fraction = min_stable_fraction
+        if correction_preset not in ("montecito", "translation"):
+            raise ValueError("Unknown correction preset")
+        if lod_method not in ("none", "empirical"):
+            raise ValueError("Unknown LoD method")
+        if not 0 < lod_quantile < 1:
+            raise ValueError("LoD quantile must be between zero and one")
+        if not np.isfinite(validation_block_size_m) or validation_block_size_m <= 0:
+            raise ValueError("Validation block size must be positive and finite")
+        self.correction_preset = correction_preset
+        self.fit_land_cover = fit_land_cover
+        self.fit_land_cover_classes = fit_land_cover_classes
+        self.lod_method = lod_method
+        self.lod_quantile = lod_quantile
+        self.validation_block_size_m = validation_block_size_m
 
         self.metadata = {}
         self.results = []
@@ -147,7 +176,7 @@ class CoregBiasPipeline:
         self.metadata["load"] = {
             "DEM keys": list(self.dems.keys()),
             "reference_label": self.reference_label,
-            "stable_dh_threshold_m": self.stable_dh_threshold,
+            "stable_dh_threshold_m": self.stable_dh_threshold if self.stable_mask_path is None else None,
             "aoi_path": str(aoi_path) if aoi_path is not None else None,
         }
 
@@ -166,7 +195,34 @@ class CoregBiasPipeline:
         slope_arr = safe_array(slope)
 
         valid_mask = np.isfinite(dh_raw_arr) & np.isfinite(slope_arr)
-        stable_mask = valid_mask & (np.abs(dh_raw_arr) < self.stable_dh_threshold)
+        if self.stable_mask_path is not None:
+            # A byte mask must be compared to its stable code, not cast to bool:
+            # nodata=255 would otherwise become True.
+            import rasterio
+            with rasterio.open(self.stable_mask_path) as src:
+                if (src.crs != self.ref.crs or src.shape != dh_raw_arr.shape
+                        or not src.transform.almost_equals(self.ref.transform, precision=1e-6)):
+                    raise ValueError("Stable mask must match the reference grid exactly")
+                external = src.read(1, masked=True)
+                stable_mask = valid_mask & ~np.ma.getmaskarray(external) & (external.data == self.stable_value)
+            definition = f"External stable mask: {self.stable_mask_path} (stable={self.stable_value})"
+        else:
+            stable_mask = valid_mask & (np.abs(dh_raw_arr) < self.stable_dh_threshold)
+            definition = f"|dh_raw| < {self.stable_dh_threshold:.3f} m"
+
+        if self.fit_land_cover is not None:
+            import rasterio
+            from rasterio.vrt import WarpedVRT
+            from rasterio.enums import Resampling
+            with rasterio.open(self.fit_land_cover) as src:
+                if src.crs is None or src.count != 1:
+                    raise ValueError("Fitting land cover needs a single band and CRS")
+                with WarpedVRT(src, crs=self.ref.crs, transform=self.ref.transform,
+                               height=self.ref.shape[0], width=self.ref.shape[1],
+                               resampling=Resampling.nearest, dtype="float32", nodata=np.nan) as vrt:
+                    cover = vrt.read(1, masked=True).filled(np.nan)
+            stable_mask &= np.isfinite(cover) & np.isin(cover, self.fit_land_cover_classes)
+            definition += f" AND land cover in {list(self.fit_land_cover_classes)} (fitting only)"
 
         self.stable_masks[pair_name] = stable_mask
 
@@ -174,12 +230,15 @@ class CoregBiasPipeline:
         valid_count = np.count_nonzero(valid_mask)
         stable_pct = 100 * stable_count / valid_count if valid_count > 0 else np.nan
 
-        print(f"Stable threshold: |dh_raw| < {self.stable_dh_threshold:.3f} m")
+        if stable_count < self.min_stable_pixels or not np.isfinite(stable_pct) or stable_pct / 100 < self.min_stable_fraction:
+            raise ValueError(f"Insufficient usable stable terrain: {stable_count} pixels, {stable_pct:.3f}%")
+        print(f"Stable selection: {definition}")
         print(f"Stable pixels: {stable_count:,} / {valid_count:,}")
         print(f"Stable fraction: {stable_pct:.2f}%")
 
         self.metadata[f"{pair_name}_stable_mask"] = {
-            "threshold_m": self.stable_dh_threshold,
+            "definition": definition,
+            "mask_file": str(self.stable_mask_path) if self.stable_mask_path else None,
             "stable_pixels": int(stable_count),
             "valid_pixels": int(valid_count),
             "stable_fraction_percent": float(stable_pct),
@@ -197,7 +256,7 @@ class CoregBiasPipeline:
         plt.colorbar(label="Stable terrain mask")
         plt.title(
             f"{pair_name} - Stable Terrain Mask\n"
-            f"|dh_raw| < {self.stable_dh_threshold:.2f} m, "
+            f"{definition}, "
             f"stable area = {stable_pct:.2f}%"
         )
         plt.tight_layout()
@@ -209,16 +268,36 @@ class CoregBiasPipeline:
     # Coregistration
     # ---------------------------------------------------
     def coregister(self, tgt, stable_mask):
+        if self.correction_preset == "translation":
+            offset = -float(np.median(safe_array(tgt - self.ref)[stable_mask]))
+            print(f"\nInitial vertical correction: {offset:+.6f} m; fitting NuthKaab")
+            shifted = tgt + offset
+            coreg = xdem.coreg.NuthKaab(subsample=100000)
+            coreg.fit(self.ref, shifted, inlier_mask=stable_mask, random_state=42)
+            result = coreg.apply(shifted)
+            if result.transform != self.ref.transform or result.shape != self.ref.shape:
+                result = result.reproject(self.ref)
+            self.metadata["coreg"] = {
+                "method": "Median vertical shift + NuthKaab",
+                "initial_vertical_shift_m": offset,
+                "matrix_after_initial_shift": np.asarray(coreg.to_matrix()).tolist(),
+                "subsample": 100000, "random_state": 42,
+                "vertical_datum_conversion": "None; empirical offset",
+            }
+            return result
+
         print("\nRunning coregistration: NuthKaab + ICP")
 
         coreg = xdem.coreg.NuthKaab() + xdem.coreg.ICP()
         coreg.fit(self.ref, tgt, inlier_mask=stable_mask)
         tgt_coreg = coreg.apply(tgt)
+        if tgt_coreg.transform != self.ref.transform or tgt_coreg.shape != self.ref.shape:
+            tgt_coreg = tgt_coreg.reproject(self.ref)
 
         self.metadata["coreg"] = {
             "method": "NuthKaab + ICP",
             "used_stable_mask": True,
-            "stable_threshold_m": self.stable_dh_threshold,
+            "stable_mask": str(self.stable_mask_path) if self.stable_mask_path else f"abs(raw DoD) < {self.stable_dh_threshold}",
         }
 
         return tgt_coreg
@@ -227,6 +306,12 @@ class CoregBiasPipeline:
     # Production bias correction
     # ---------------------------------------------------
     def bias_correct_production(self, tgt, stable_mask):
+        if self.correction_preset == "translation":
+            self.metadata["production_bias"] = {
+                "status": "disabled", "reason": "Translation preset: vertical bias handled during coregistration",
+                "deramp": False, "directional": False, "aspect": False,
+            }
+            return tgt
         print(
             f"\nRunning production bias correction: "
             f"deramp_order={self.deramp_order}, "
@@ -428,6 +513,10 @@ class CoregBiasPipeline:
             / f"{safe_pair}_COREG_BIAS_ASPECT_o{self.deramp_order}_a{self.directional_angle}_dDEM.tif"
         )
 
+        if self.correction_preset == "translation":
+            corrected_dem_path = dem_dir / "post_coreg_bias.tif"
+            corrected_dh_path = dem_dir / "dod_corrected.tif"
+
         tgt_coreg.save(coreg_dem_path)
         tgt_corrected.save(corrected_dem_path)
 
@@ -525,12 +614,74 @@ class CoregBiasPipeline:
     # ---------------------------------------------------
     # Production run
     # ---------------------------------------------------
+    @property
+    def reference_profile(self):
+        # Raster.profile can be absent or describe the source grid after reprojection.
+        return dict(driver="GTiff", count=1, dtype="float32", nodata=-9999.0,
+                    crs=self.ref.crs, transform=self.ref.transform,
+                    height=self.ref.shape[0], width=self.ref.shape[1])
+
+    def split_stable_for_lod(self, stable_mask, tgt):
+        # Reuse the tested numerical helpers; no diagnostic CLI is launched.
+        from compare_dem_corrections import spatial_split, write
+        if (not self.ref.crs.is_projected or self.ref.crs.linear_units_factor[1] != 1
+                or self.ref.transform.b or self.ref.transform.d
+                or self.ref.res[0] != self.ref.res[1]):
+            raise ValueError("LoD check blocks require a square, unrotated grid in metres")
+        fit, check = spatial_split(stable_mask, self.ref.res[0], self.validation_block_size_m)
+        if fit.sum() < self.min_stable_pixels or check.sum() < max(100, self.min_stable_pixels):
+            raise ValueError("Insufficient stable pixels in fit/check blocks for LoD")
+        valid = np.isfinite(safe_array(tgt - self.ref))
+        split = np.where(valid, 0.0, np.nan)
+        split[fit], split[check] = 1, 2
+        write(output_dir / "stable_fit_check.tif", split, self.reference_profile,
+              fit_value=1, check_value=2, block_size_m=self.validation_block_size_m)
+        return fit, check
+
+    def save_lod_outputs(self, tgt_corrected, fit, check):
+        from screen_dem_difference_empirical import empirical_limit, screen
+        from compare_dem_corrections import write
+        dod = safe_array(tgt_corrected - self.ref).astype("float32")
+        limit, report = empirical_limit(dod, fit, check, self.lod_quantile,
+                                        min_pixels=max(100, self.min_stable_pixels))
+        valid = np.isfinite(dod)
+        filtered, _ = screen(dod, valid, limit)
+        dem_dir = output_dir / "final_dem_products"
+        path = dem_dir / "dod_lod_filtered.tif"
+        tags = dict(method="Empirical absolute stable-residual quantile", threshold_m=limit,
+                    quantile=self.lod_quantile, operation="corrected post minus pre",
+                    zero_meaning="At or below threshold; not proof of zero physical change",
+                    nodata_meaning="Missing corrected DEM overlap; no land-cover output restriction",
+                    status="Provisional empirical LoD; not a validated full-area confidence bound")
+        write(path, filtered, self.reference_profile, **tags)
+        write(dem_dir / "lod_threshold.tif", np.where(valid, limit, np.nan), self.reference_profile, **tags)
+        report.update(method="empirical", scope="Full valid corrected DEM overlap",
+                      corrected_dod=self.metadata["final_saved_outputs"]["corrected_dDEM"],
+                      filtered_dod=str(path), valid_pixels=int(valid.sum()),
+                      retained_pixels=int((valid & (np.abs(dod) > limit)).sum()),
+                      fit_land_cover=str(self.fit_land_cover) if self.fit_land_cover else None,
+                      fit_land_cover_classes=list(self.fit_land_cover_classes) if self.fit_land_cover else None,
+                      block_size_m=self.validation_block_size_m,
+                      limitations=["Candidate stable terrain is not independently verified unchanged ground.",
+                                   "Quantile is fitted on correction-fit pixels; check blocks are excluded from fitting.",
+                                   "Check blocks have been reused in earlier model comparisons, not independent final validation.",
+                                   "Check coverage does not establish 95% confidence across other terrain or land cover.",
+                                   "Survey chronology and vertical datum must be verified separately."])
+        (dem_dir / "lod_report.json").write_text(json.dumps(report, indent=2))
+        self.metadata["lod"] = report
+        print(f"Empirical LoD applied: +/- {limit:.6f} m; check coverage "
+              f"{100 * report['check']['within_threshold_fraction']:.2f}%")
+        print(f"LoD-filtered DoD: {path}")
+
     def run_pair(self, pair_name, tgt):
         print("\n==============================")
         print(f"Processing pair: {pair_name}")
         print("==============================")
 
         stable_mask = self.build_stable_mask(pair_name, tgt)
+        check_mask = None
+        if self.lod_method != "none":
+            stable_mask, check_mask = self.split_stable_for_lod(stable_mask, tgt)
 
         self.analyze(
             label=f"{pair_name}_RAW",
@@ -539,11 +690,14 @@ class CoregBiasPipeline:
             stable_mask=stable_mask,
         )
 
-        self.analyze_uncertainty(
-            label=f"{pair_name}_RAW",
-            tgt=tgt,
-            stable_mask=stable_mask,
-        )
+        # Translation preset assesses uncertainty on the final corrected DEM.
+        # Its coregistered and final DEMs are identical; raw offset is not random error.
+        if self.correction_preset == "montecito":
+            self.analyze_uncertainty(
+                label=f"{pair_name}_RAW",
+                tgt=tgt,
+                stable_mask=stable_mask,
+            )
 
         tgt_coreg = self.coregister(tgt, stable_mask=stable_mask)
 
@@ -554,11 +708,14 @@ class CoregBiasPipeline:
             stable_mask=stable_mask,
         )
 
-        self.analyze_uncertainty(
-            label=f"{pair_name}_COREG_ONLY",
-            tgt=tgt_coreg,
-            stable_mask=stable_mask,
-        )
+        # Translation preset assesses uncertainty on the final corrected DEM.
+        # Its coregistered and final DEMs are identical; raw offset is not random error.
+        if self.correction_preset == "montecito":
+            self.analyze_uncertainty(
+                label=f"{pair_name}_COREG_ONLY",
+                tgt=tgt_coreg,
+                stable_mask=stable_mask,
+            )
 
         tgt_corrected = self.bias_correct_production(
             tgt=tgt_coreg,
@@ -566,17 +723,15 @@ class CoregBiasPipeline:
         )
 
         if tgt_corrected is None:
-            print("Skipping final corrected analysis because correction failed.")
-            return
+            raise RuntimeError("Production bias correction failed; no final corrected products generated")
 
-        final_label = (
-            f"{pair_name}_COREG_BIAS_ASPECT_o{self.deramp_order}_a{self.directional_angle}"
-        )
+        final_label = (f"{pair_name}_COREG_BIAS_TRANSLATION" if self.correction_preset == "translation"
+                       else f"{pair_name}_COREG_BIAS_ASPECT_o{self.deramp_order}_a{self.directional_angle}")
 
         self.analyze(
             label=final_label,
             tgt=tgt_corrected,
-            stage="coreg_bias_aspect",
+            stage="coreg_bias_translation" if self.correction_preset == "translation" else "coreg_bias_aspect",
             stable_mask=stable_mask,
         )
 
@@ -592,6 +747,8 @@ class CoregBiasPipeline:
             tgt_coreg=tgt_coreg,
             tgt_corrected=tgt_corrected,
         )
+        if self.lod_method != "none":
+            self.save_lod_outputs(tgt_corrected, stable_mask, check_mask)
 
     # ---------------------------------------------------
     # Summary tables
@@ -687,68 +844,174 @@ class CoregBiasPipeline:
 # ===================================================
 # RUN PIPELINE
 # ===================================================
-pipeline = CoregBiasPipeline(
-    reference_label=REFERENCE_LABEL,
-    deramp_order=DERAMP_ORDER,
-    directional_angle=DIRECTIONAL_ANGLE,
-    stable_dh_threshold=STABLE_TERRAIN_DH_THRESHOLD,
-    map_clim=MAP_CLIM,
-)
+def main(argv=None):
+    """Run the main correction pipeline with an optional empirical LoD export."""
+    import argparse
+    import rasterio
 
-pipeline.load_dems(DEM_PATHS, aoi_path=AOI_PATH)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stable-mask", type=Path, help="External stable-cell raster; replaces the raw DoD threshold")
+    parser.add_argument("--stable-value", type=int, default=1)
+    parser.add_argument("--min-stable-pixels", type=int, default=1000)
+    parser.add_argument("--min-stable-fraction", type=float, default=0.01)
+    parser.add_argument("--correction-preset", choices=("montecito", "translation"), default="montecito")
+    parser.add_argument("--fit-land-cover", type=Path, help="Optional land cover for stable fitting pixels only")
+    parser.add_argument("--fit-land-cover-classes", type=int, nargs="+", default=[31, 71])
+    parser.add_argument("--lod-method", choices=("none", "empirical"), default="none")
+    parser.add_argument("--lod-quantile", type=float, default=0.95)
+    parser.add_argument("--validation-block-size-m", type=float, default=250.0)
+    parser.add_argument("--pre", type=Path, default=DEM_PATHS["pre"])
+    parser.add_argument("--post", type=Path, default=DEM_PATHS["post"])
+    parser.add_argument("--aoi", type=Path, default=None,
+                        help="Optional vector mask; omitted for already-masked input DEMs")
+    parser.add_argument("--output-dir", type=Path, default=output_dir)
+    parser.add_argument("--show-plots", action="store_true",
+                        help="Show interactive plots; default saves PNGs and closes figures")
+    parser.add_argument("--check-inputs", action="store_true",
+                        help="Validate inputs and method availability without running corrections")
+    args = parser.parse_args(argv)
+    for path in (args.pre, args.post, args.aoi, args.stable_mask, args.fit_land_cover):
+        if path is not None and not path.is_file():
+            parser.error(f"Input not found: {path}")
+    with rasterio.open(args.pre) as pre, rasterio.open(args.post) as post:
+        if pre.crs is None or post.crs is None:
+            parser.error("Both DEMs must have a CRS")
+        print(f"xDEM {xdem.__version__}")
+        print(f"Pre:  {args.pre}")
+        print(f"Post: {args.post}")
+        print(f"Reference grid: {pre.crs}, {pre.res}, {pre.height} rows x {pre.width} columns")
+        print("Input grids match:", pre.crs == post.crs and pre.transform == post.transform and pre.shape == post.shape)
+    if not 0 < args.lod_quantile < 1 or not np.isfinite(args.validation_block_size_m) or args.validation_block_size_m <= 0:
+        parser.error("LoD requires a quantile in (0, 1) and a positive finite block size")
+    if args.min_stable_pixels < 1 or not 0 <= args.min_stable_fraction <= 1:
+        parser.error("Stable quality limits must be positive pixels and a fraction from 0 to 1")
+    if args.stable_mask is not None:
+        with rasterio.open(args.pre) as pre, rasterio.open(args.stable_mask) as mask:
+            if (mask.crs != pre.crs or mask.shape != pre.shape
+                    or not mask.transform.almost_equals(pre.transform, precision=1e-6)):
+                parser.error("Stable mask must match the pre DEM grid")
+            if mask.nodata == args.stable_value:
+                parser.error("Stable code cannot equal mask nodata")
+        print(f"Stable mask: {args.stable_mask}; stable code: {args.stable_value}; raw DoD threshold disabled")
+    # Construct the exact production methods to catch incompatible xDEM installs early.
+    xdem.coreg.NuthKaab() + xdem.coreg.ICP()
+    xdem.coreg.Deramp(poly_order=DERAMP_ORDER)
+    xdem.coreg.DirectionalBias(angle=DIRECTIONAL_ANGLE, fit_or_bin="bin", bin_sizes=1000,
+                              bin_apply_method="per_bin", bin_statistic=np.nanmedian)
+    xdem.coreg.TerrainBias(terrain_attribute="aspect", fit_or_bin="bin",
+                          bin_sizes={"aspect": ASPECT_BIN_EDGES}, bin_apply_method="per_bin",
+                          bin_statistic=np.nanmedian)
+    print(f"Correction preset: {args.correction_preset}; LoD method: {args.lod_method}")
+    print(f"Output: {args.output_dir}")
+    if args.check_inputs:
+        print("Input and method checks passed. No processing or output writes performed.")
+        return
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        parser.error("Output directory is not empty; choose a new --output-dir for this run")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # The original class uses module-level output_dir for all its products.
+    globals()["output_dir"] = args.output_dir
+    dem_paths = {"pre": args.pre, "post": args.post}
+    original_show = plt.show
+    if not args.show_plots:
+        plt.switch_backend("Agg")
+        plot_dir = args.output_dir / "plots"
+        plot_dir.mkdir()
+        plot_number = 0
 
-pairs = {
-    "post-pre": pipeline.dems["post"],
-}
+        def save_plot(*unused_args, **unused_kwargs):
+            nonlocal plot_number
+            plot_number += 1
+            figure = plt.gcf()
+            figure.savefig(plot_dir / f"figure_{plot_number:03d}.png", dpi=150)
+            plt.close(figure)
 
-for pair_name, tgt in pairs.items():
-    pipeline.run_pair(pair_name, tgt)
+        plt.show = save_plot
+    try:
+        pipeline = CoregBiasPipeline(
+            reference_label=REFERENCE_LABEL,
+            deramp_order=DERAMP_ORDER,
+            directional_angle=DIRECTIONAL_ANGLE,
+            stable_dh_threshold=STABLE_TERRAIN_DH_THRESHOLD,
+            map_clim=MAP_CLIM,
+            stable_mask_path=args.stable_mask,
+            stable_value=args.stable_value,
+            min_stable_pixels=args.min_stable_pixels,
+            min_stable_fraction=args.min_stable_fraction,
+            correction_preset=args.correction_preset,
+            fit_land_cover=args.fit_land_cover,
+            fit_land_cover_classes=args.fit_land_cover_classes,
+            lod_method=args.lod_method,
+            lod_quantile=args.lod_quantile,
+            validation_block_size_m=args.validation_block_size_m,
+        )
 
-pipeline.info()
+        pipeline.load_dems(dem_paths, aoi_path=args.aoi)
+
+        pairs = {
+            "post-pre": pipeline.dems["post"],
+        }
+
+        for pair_name, tgt in pairs.items():
+            pipeline.run_pair(pair_name, tgt)
+
+        (output_dir / "pipeline_metadata.json").write_text(json.dumps(pipeline.metadata, indent=2, default=str))
+        pipeline.info()
 
 
-# ===================================================
-# SAVE / PRINT RESULTS
-# ===================================================
-pd.set_option("display.max_columns", None)
-pd.set_option("display.max_rows", None)
-pd.set_option("display.max_colwidth", None)
-pd.set_option("display.float_format", "{:.6f}".format)
+        # ===================================================
+        # SAVE / PRINT RESULTS
+        # ===================================================
+        pd.set_option("display.max_columns", None)
+        pd.set_option("display.max_rows", None)
+        pd.set_option("display.max_colwidth", None)
+        pd.set_option("display.float_format", "{:.6f}".format)
 
-df = pd.DataFrame(pipeline.results)
-rank_df = pipeline.summarize_runs()
-unc_df = pipeline.build_uncertainty_table()
+        df = pd.DataFrame(pipeline.results)
+        rank_df = pipeline.summarize_runs()
+        unc_df = pipeline.build_uncertainty_table()
 
-print("\n========================================")
-print("PER-RUN METRICS")
-print("========================================")
-print(df)
+        print("\n========================================")
+        print("PER-RUN METRICS")
+        print("========================================")
+        print(df)
 
-print("\n========================================")
-print("FINAL RANKED TABLE")
-print("========================================")
-print(rank_df)
+        print("\n========================================")
+        print("FINAL RANKED TABLE")
+        print("========================================")
+        print(rank_df)
 
-print("\n========================================")
-print("UNCERTAINTY SUMMARY TABLE")
-print("========================================")
-print(unc_df)
+        print("\n========================================")
+        print("UNCERTAINTY SUMMARY TABLE")
+        print("========================================")
+        print(unc_df)
 
-output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-raw_csv = output_dir / "xdem_run_metrics_raw.csv"
-ranked_csv = output_dir / "xdem_run_metrics_ranked.csv"
-unc_csv = output_dir / "xdem_uncertainty_summary.csv"
+        raw_csv = output_dir / "xdem_run_metrics_raw.csv"
+        ranked_csv = output_dir / "xdem_run_metrics_ranked.csv"
+        unc_csv = output_dir / "xdem_uncertainty_summary.csv"
 
-df.to_csv(raw_csv, index=False)
-rank_df.to_csv(ranked_csv, index=False)
-unc_df.to_csv(unc_csv, index=False)
+        df.to_csv(raw_csv, index=False)
+        rank_df.to_csv(ranked_csv, index=False)
+        unc_df.to_csv(unc_csv, index=False)
 
-print("\n========================================")
-print("CSV OUTPUTS SAVED")
-print("========================================")
-print(f"Raw metrics:         {raw_csv}")
-print(f"Ranked metrics:      {ranked_csv}")
-print(f"Uncertainty summary: {unc_csv}")
-print(f"Histogram values:    {output_dir / 'histogram_values'}")
-print(f"Final DEM products:  {output_dir / 'final_dem_products'}")
+        print("\n========================================")
+        print("CSV OUTPUTS SAVED")
+        print("========================================")
+        print(f"Raw metrics:         {raw_csv}")
+        print(f"Ranked metrics:      {ranked_csv}")
+        print(f"Uncertainty summary: {unc_csv}")
+        print(f"Histogram values:    {output_dir / 'histogram_values'}")
+        print(f"Final DEM products:  {output_dir / 'final_dem_products'}")
+        failed_uncertainty = [key for key, value in pipeline.metadata.items()
+                              if key.endswith("_uncertainty") and value.get("status") != "success"]
+        if failed_uncertainty:
+            raise RuntimeError(f"Uncertainty estimation failed for {failed_uncertainty}; inspect the saved summary")
+
+    finally:
+        plt.show = original_show
+
+
+if __name__ == "__main__":
+    main()

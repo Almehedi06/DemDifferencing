@@ -1,0 +1,54 @@
+# Event paths are the only required edits for another fire using the same rules.
+# Relative paths are interpreted relative to this config file.
+batch:
+  name: example_fire
+  pairs:
+    - id: example_fire
+      pre: ../data/example_fire/pre.tif
+      post: ../data/example_fire/post.tif
+  output_dir: ../outputs/example_fire
+  mask_dirname: masks
+
+processing:
+  reference: pre
+  require_same_grid: true
+  reproject_post_to_pre: false
+  continue_on_error: false
+  overwrite: false
+
+terrain:
+  g_source: compute_dinf
+  alpha: 1.167
+  keep_intermediates: true
+  # For g_source: raster, supply existing G rasters instead:
+  g_dir: null
+  g_template: "{id}_G.tif"
+
+stable_cells:
+  g_min: null
+  g_max: 5.0
+  elev_min: null
+  elev_max: null
+  # Slope thresholds are rise/run, NOT degrees or percent. null disables a rule.
+  slope_min: null
+  slope_max: null
+  # null disables the old raw DoD screen. Set 5.0 only if you want it too.
+  dh_abs_max: null
+  stable_value: 1
+  unstable_value: 0
+  nodata_value: 255
+
+quality:
+  min_stable_pixels: 1000
+  min_stable_fraction: 0.01
+
+# Original sequence remains the default; translation selects median shift + NuthKaab.
+corrections:
+  preset: montecito
+fitting:
+  land_cover: null
+  land_cover_classes: [31, 71]
+lod:
+  method: none  # empirical enables filtering and a reserved-block check
+  quantile: 0.95
+  block_size_m: 250.0

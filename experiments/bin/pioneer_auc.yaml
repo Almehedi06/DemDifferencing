@@ -1,46 +1,39 @@
-# AUC experiment: Landlab layers vs mapped debris-flow initiation points, Pioneer Fire.
-# Follows Strauch et al. (2018): score only where slopes can fail, and draw the
-# absence cells at random away from the event. Change values here, never in the script.
-# Run from ~/DemDifferencing:
-#   ~/landlab-grid-validation/.venv/bin/python experiments/bin/auc_experiment.py experiments/bin/pioneer_auc.yaml
+# Pioneer Fire: Landlab initiation layers vs the mapped debris-flow initiation points.
+# Follows Strauch et al. (2018): score only where slopes can fail, draw the absence
+# cells away from the points and outside what the event changed. The runner is the
+# general package; this file holds only this site's paths and rules. Run from here:
+#   cd ~/landlab-grid-validation && PYTHONPATH=src python -m landlab_grid_validation ~/DemDifferencing/experiments/bin/pioneer_auc.yaml
+# (or plain `python -m landlab_grid_validation ...` where the package is installed).
+# Give every experiment a new run_name; a run is never overwritten without --overwrite.
+# Rules: landlab_grid_validation/rules.py. Keys: python -m landlab_grid_validation --help.
 
-run_name: G5-150_negatives_only         # results go to output_dir/run_name; a new name per experiment
+run_name: no_G_rule                   # results go to output_dir/run_name
 output_dir: /mnt/c/Users/amehedi/Downloads/pioneer/auc_runs
-crs: EPSG:6339                          # the .asc files don't record it
+crs: EPSG:6339                        # the .asc files do not record it
 
-model:                                  # layers to score; the first one sets the grid
+predicted:                            # layers to score; the first one sets the grid
   P_Landslide: /mnt/c/Users/amehedi/Downloads/pioneer/probability_fields/P_Landslide.asc
   P_Channel_ini: /mnt/c/Users/amehedi/Downloads/pioneer/probability_fields/P_Channel_ini.asc
   P_Combined_H: /mnt/c/Users/amehedi/Downloads/pioneer/probability_fields/P_Combined_H.asc
 
 observed:
-  points: /mnt/c/Users/amehedi/Downloads/pioneer/obs_data/Initiation_Points_final.shp
-  type_column: FailureTyp               # one AUC per type, plus all types together
-  block_cells: 1                        # 1 = a 3 x 3 block (30 m) per point; 0 = the point's cell only
+  features: /mnt/c/Users/amehedi/Downloads/pioneer/obs_data/Initiation_Points_final.shp
+  tolerance_cells: 1                  # a 3 x 3 block (30 m) per point; 0 = the point's cell only
+  group_by: [FailureTyp]              # one score per failure type, plus all together
 
-terrain:
-  elevation: /mnt/c/Users/amehedi/Downloads/pioneer/lidar_footprint_10m/topographic__elevation.asc
-  G: /mnt/c/Users/amehedi/Downloads/pioneer/main_pipeline_run/stable_cells/terrain/pioneer/G_pre_dinf.tif
-  G_resampling: nearest                 # 1 m G at each cell centre; max would call 46% of cells channel
-  ddem: /mnt/c/Users/amehedi/Downloads/pioneer/obs_data/dod_gain_masked.tif   # marks the surveyed area and the footprint
+domain:                               # cells both classes may come from (every rule holds)
+  - {slope_of: /mnt/c/Users/amehedi/Downloads/pioneer/lidar_footprint_10m/topographic__elevation.asc, min: 17}
+  - {raster: /mnt/c/Users/amehedi/Downloads/pioneer/obs_data/dod_gain_masked.tif, finite: true, resampling: average}   # the surveyed area
 
-domain:                                 # applies to initiation AND absence cells (fair: both classes alike)
-  slope_min_deg: 17                     # below 17 degrees the ground is stable (Strauch et al. 2018)
-  slope_max_deg: null
-  G_min: null
-  G_max: null
-  perimeter: null                       # optional polygon; cells whose centre is inside it
-
-negatives:                              # extra rules for absence cells only; a G rule here makes
-                                        # the test easier (failures start in hollows); move it to domain to compare
-  G_min: 5                              # leave out stable ridges...
-  G_max: 150                            # ...and channels
-  min_distance_m: 50                    # from any initiation point
-  footprint_threshold_m: 0.5            # leave out cells the event changed by more than this (dDEM)
-  footprint_buffer_cells: 1             # and this many cells around them
-  n: all                                # all = every remaining cell; or a number, drawn at random
+negatives:
+  rules: []                           # extra rules for absence cells only, e.g.
+                                      # - {raster: .../G_pre_dinf.tif, min: 5, max: 150, resampling: nearest}
+  exclude:                            # absence cells matching any of these are dropped
+    - {raster: /mnt/c/Users/amehedi/Downloads/pioneer/obs_data/dod_gain_masked.tif, abs_min: 0.5, buffer_cells: 1, resampling: average}
+  min_distance_m: 50                  # from any point
+  n: all                              # every remaining cell; or a number, drawn at random
   seed: 42
+  stratify: null                      # or {raster: classes.tif, resampling: nearest}: draw per class as the points fall
 
-uncertainty:
-  bootstrap: 1000                       # resamples of the initiation points for the 95% interval
-  seed: 42
+bootstrap: 1000                       # resamples of the points for the 95% interval
+seed: 42

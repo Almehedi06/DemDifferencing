@@ -1,0 +1,16 @@
+name: dem-differencing
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - xdem=0.2.2
+  - geoutils=0.2.5
+  - numpy
+  - rasterio
+  - pandas
+  - matplotlib
+  - seaborn
+  - pyyaml
+  - pip
+  - pip:
+      - whitebox==2.3.6
