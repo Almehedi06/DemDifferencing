@@ -46,6 +46,9 @@ SETTINGS = {
         "n": "all", "seed": 42,                                               # every qualifying cell
     },
     "bootstrap": 1000, "seed": 42,                                            # 95% interval by resampling the points
+    "thresholds": [0.5],                                                      # cutoffs for precision, recall, f1, csi, area flagged
+    "optimal_threshold": True,                                                # also at the Youden cutoff (max TPR - FPR)
+    "fpr_levels": [0.10, 0.05],                                               # TPR at these false-positive rates (first one is printed)
 }
 
 
@@ -62,9 +65,13 @@ def _log(path, row):
 def evaluate_hazard(model_dir=".", run_name=None, params=None, out_dir="evaluation",
                     maps=True, map_threshold=0.5):
     """Score P_Landslide, P_Channel_ini and P_Combined_H (.asc in model_dir) against the
-    mapped initiation points. Prints AUC [95% interval] by failure type, shows the ROC
-    curves, and logs the run. params: optional dict of model settings to keep with the
-    scores, e.g. {"Csoil": Csoil, "tau_c_low": 1.1}.
+    mapped initiation points. Prints, by failure type: AUC [95% interval], TPR at a 10%
+    false-positive rate, the area flagged and the precision at P >= 0.5 (and as a
+    multiple of the base rate), the Brier score and the share of positive cells the
+    model scores 0; shows the ROC curves and the sampling map; logs the run. The full
+    table (confusion counts, f1, csi, the Youden cutoff, ...) is metrics.csv.
+    params: optional dict of model settings to keep with the scores, e.g.
+    {"Csoil": Csoil, "tau_c_low": 1.1}.
 
     maps=True also draws each layer against the points on the Landlab grid and writes
     GeoTIFFs: the observations as yes/no rasters and one agreement map per layer, with
@@ -89,24 +96,31 @@ def evaluate_hazard(model_dir=".", run_name=None, params=None, out_dir="evaluati
         domain=mask_from_rules(grid, crs, SETTINGS["domain"]),
         absences=Absences(exclude=mask_from_rules(grid, crs, neg["exclude"], how="any"),
                           min_distance_m=neg["min_distance_m"], n=neg["n"], seed=neg["seed"]),
-        bootstrap=SETTINGS["bootstrap"], seed=SETTINGS["seed"])
+        bootstrap=SETTINGS["bootstrap"], seed=SETTINGS["seed"], thresholds=tuple(SETTINGS["thresholds"]),
+        optimal_threshold=SETTINGS["optimal_threshold"], fpr_levels=tuple(SETTINGS["fpr_levels"]))
+    import geopandas as gpd
+
     ev.write(run_dir, settings={"run_name": run_name, "model": {n: str(model_dir / f"{n}.asc") for n in LAYERS},
                                 "points": str(POINTS), **SETTINGS},
-             inputs=[model_dir / f"{n}.asc" for n in LAYERS] + [POINTS, ELEVATION, DDEM])
+             inputs=[model_dir / f"{n}.asc" for n in LAYERS] + [POINTS, ELEVATION, DDEM],
+             points=gpd.read_file(POINTS).to_crs(crs),                       # sampling_map.png: the cells used
+             background=raster_to_node_field(grid, crs, ELEVATION, raster_crs=CRS))
+    _display(run_dir / "sampling_map.png")
 
     m = pd.DataFrame(ev.table)
-    m["AUC [95%]"] = (m.auc.map("{:.2f}".format) + " [" + m.auc_low.map("{:.2f}".format)
-                      + "-" + m.auc_high.map("{:.2f}".format) + "]")
-    _show(m.pivot(index="group", columns="layer", values="AUC [95%]")[LAYERS], run_dir / "roc.png")
+    print(ev.summary())
+    _display(run_dir / "roc.png")
 
     hits = _hazard_maps(model_dir, run_dir, map_threshold, grid, crs, layers) if maps else {}
 
+    # one row per run, the three numbers to compare runs by (all points): AUC, the optimal
+    # probability (highest TPR - FPR) and the precision there; every other score is in metrics.csv
     row = {"run": run_name, **(params or {})}
-    row.update({f"AUC_{k}": m.query("group == 'All' and layer == @k").auc.item() for k in LAYERS})
-    if hits:
-        row["map_threshold"] = map_threshold
-        for name, (hit, chance) in hits.items():
-            row[f"points_hit_{name}"], row[f"chance_hit_{name}"] = round(hit, 4), round(chance, 4)
+    for k in LAYERS:
+        r = m.query("group == 'All' and layer == @k").iloc[0]
+        row.update({f"AUC_{k}": r.auc, f"optimal_P_{k}": r.optimal_threshold,
+                    f"precision_at_optimal_{k}": r.precision_at_optimal,
+                    f"precision_x_base_{k}": r.precision_lift_at_optimal})
     _log(out_dir / "runs_log.csv", row)
     return m
 

@@ -323,97 +323,6 @@ def panels_3d(layer_dir, suffix, base, dem, ref_ext, shape, scene_w_m, vert_exag
 
 
 
-def figure_performance(pioneer, layers_dir, out_dir):
-    """Performance of the three modelled layers against mapped initiation evidence.
-
-    The dDEM is deliberately absent. It is not a competing model: it is a second
-    evidence stream derived from the same UAV survey the initiation points were
-    mapped from, so benchmarking it beside independently-built susceptibility
-    layers was never like-for-like. It belongs in the evidence figures, not here.
-
-    The point-wise panel was dropped on 2026-09-24; the cell-wise AUC carries
-    the comparison. Panel (a) uses AUC rather than CSI/F1 because the mechanisms have different
-    positive-cell counts against a shared negative pool. Precision-based scores
-    shift with class ratio, so they cannot be compared *across* mechanisms; AUC
-    can. Its last group, "All types", pools every mechanism's evidence: "did
-    something initiate here", type ignored.
-    """
-    import csv as _csv
-    from sklearn.metrics import roc_auc_score, roc_curve
-
-    names = {"P_Landslide": "Landslide",
-             "P_Channel_ini": "Channel initiation",
-             "P_Combined_H": "Combined hillslope"}
-    colours = {"P_Landslide": "#8c8c8c", "P_Channel_ini": "#3d8ce8",
-               "P_Combined_H": "#e8a33d"}
-    order = list(names)
-    mechs = ["LS", "Runoff", "Firehose", "All"]
-
-    cw = list(_csv.DictReader(open(pioneer / "cellwise_validation/cellwise_metrics.csv")))
-    auc_by = {(r["layer"], r["mechanism"]): float(r["roc_auc"]) for r in cw
-              if r["negatives"] == "balanced"}
-    n_cells = {r["mechanism"]: int(r["n_positive_cells"]) for r in cw
-               if r["negatives"] == "balanced"}
-
-    ev_dir = pioneer / "evidence_rasters"
-    with rasterio.open(ev_dir / "evidence_LS.tif") as src:
-        pos = src.read(1) == 1
-    with rasterio.open(ev_dir / "evidence_absence.tif") as src:
-        neg = src.read(1) == 1
-    for m in ("Runoff", "Firehose"):
-        with rasterio.open(ev_dir / f"evidence_{m}.tif") as src:
-            neg &= ~(src.read(1) == 1)
-    neg &= ~pos
-
-    roc = {}
-    for stem in order:
-        with rasterio.open(layers_dir / f"{stem}.tif") as src:
-            score = src.read(1, masked=True).filled(np.nan).astype("float64")
-        f = np.isfinite(score)
-        y = np.r_[np.ones(int((pos & f).sum())), np.zeros(int((neg & f).sum()))]
-        v = np.r_[score[pos & f], score[neg & f]]
-        fpr, tpr, _ = roc_curve(y, v)
-        roc[stem] = (fpr, tpr, float(roc_auc_score(y, v)))
-
-    fig, axes = plt.subplots(1, 2, figsize=(13.5, 6.0), constrained_layout=True)
-    w = 0.26
-
-    xm = np.arange(len(mechs))
-    for i, stem in enumerate(order):
-        axes[0].bar(xm + (i - 1) * w, [auc_by[(stem, m)] for m in mechs], w,
-                    color=colours[stem], edgecolor="black", linewidth=0.7, label=names[stem])
-    axes[0].axhline(0.5, ls="--", color="0.35", lw=1.3)
-    axes[0].text(0.015, 0.238, "chance", transform=axes[0].transAxes,
-                 fontsize=11, color="0.3", ha="left", va="bottom")
-    axes[0].axvline(len(mechs) - 1.5, color="0.55", lw=1.0, ls=":")
-    axes[0].set_xticks(xm)
-    axes[0].set_xticklabels([f"{'All types' if m == 'All' else m}\n({n_cells[m]} cells)"
-                             for m in mechs])
-    axes[0].set_ylim(0.4, 0.85); axes[0].set_ylabel("AUC", labelpad=8)
-    axes[0].set_title("Cell-wise by mechanism", pad=10)
-    axes[0].legend(loc="upper right", framealpha=0.96, borderpad=0.6)
-
-    axes[1].plot([0, 1], [0, 1], "--", color="0.5", linewidth=1.2, label="No skill")
-    for stem in order:
-        fpr, tpr, auc = roc[stem]
-        axes[1].plot(fpr, tpr, linewidth=2.4, color=colours[stem],
-                     label=f"{names[stem]}  ({auc:.2f})")
-    axes[1].set_xlim(0, 1); axes[1].set_ylim(0, 1.02)
-    axes[1].set_xlabel("False positive rate")
-    axes[1].set_ylabel("True positive rate", labelpad=8)
-    axes[1].set_title("ROC, cell-wise landslides  (AUC)", pad=10)
-    axes[1].legend(loc="lower right", framealpha=0.96, borderpad=0.6)
-
-    axes[0].grid(axis="y", linewidth=0.5, alpha=0.5); axes[0].set_axisbelow(True)
-    axes[1].grid(linewidth=0.5, alpha=0.5); axes[1].set_axisbelow(True)
-    for ax, tag in zip(axes, "ab"):
-        ax.text(0.022, 0.975, tag, transform=ax.transAxes, ha="left", va="top",
-                fontsize=18, fontweight="bold",
-                bbox=dict(boxstyle="square,pad=0.32", facecolor="white",
-                          edgecolor="0.25", linewidth=1.0))
-    save(fig, out_dir, "fig7_performance")
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -506,7 +415,6 @@ def main(argv=None):
     fig.text(0.988, 0.012, ATTRIB, ha="right", fontsize=9, color="0.3")
     save(fig, args.output_dir, "fig6_uav_erosion_3d")
 
-    figure_performance(args.pioneer, args.local_layers, args.output_dir)
     print(f"\nOutputs: {args.output_dir}")
 
 

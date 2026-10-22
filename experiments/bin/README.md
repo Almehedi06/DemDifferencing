@@ -5,63 +5,9 @@ the M1–M4 dDEM pipeline** in `scripts/` and `methods/`: nothing here is
 imported by that pipeline, and nothing here writes into its outputs. Everything
 reads only and writes to a fresh directory.
 
-Two live scripts. Run from the repo root with `xdem_env` active.
-
----
-
-## `validate_hazard_layers.py` — performance
-
-Scores the modelled probability layers and the dDEM erosion layer against the
-89 USGS-mapped debris-flow initiation points.
-
-```bash
-conda activate xdem_env
-python experiments/bin/validate_hazard_layers.py                       # defaults: single-cell
-python experiments/bin/validate_hazard_layers.py --window-m 30 \
-    --output-dir .../hazard_layer_validation_window30m     # 30 m window
-```
-
-**Positives** are the mapped initiation points, scored per mechanism (LS n=47,
-Runoff n=22, Firehose n=20) rather than pooled — the three have very different
-n and pooling hides that.
-**Negatives** are `negative_points/random90_unbiased.shp`: 90 points >50 m from
-every mapped initiation point, shared across all three mechanisms, since
-"nothing was mapped here" is a negative for all of them equally.
-
-Two validations, deliberately assuming different things:
-
-| | needs absence points? | what it reports |
-| --- | --- | --- |
-| Confusion matrix | yes | TP/FP/FN/TN, precision, recall, specificity, F1, CSI, MCC at a fixed cutoff |
-| Success-rate curve | **no** | fraction of points captured vs. fraction of area flagged (Chung & Fabbri) |
-
-The success-rate table sidesteps the pseudo-absence-quality question entirely,
-which is why it is the headline. ROC-AUC/PR-AUC are computed but kept as
-secondary columns: they average over thresholds nobody would operationally use
-and inflate under spatially clustered test points, which these are.
-
-Useful options:
-
-- `--window-m 30` — score each point as the max within a 30 m footprint
-  instead of the single nearest cell. Applied to positive **and** absence
-  points; an asymmetric window inflates recall for free.
-- `--domain-raster G_pre_dinf.tif --domain-max 500` — drop points outside a
-  terrain envelope (the "uplands" test).
-- `--mechanisms LS` — restrict to one mechanism.
-
-### Things in here that are easy to get wrong
-
-- **Mid-rank tie handling.** `P_Landslide` is 92% exact zero. A naive
-  descending scan puts the 10%-area threshold inside that tied block, so every
-  point scores as "captured in the top 10%" — an artifact of the tie, not
-  skill. `area_fraction_needed()` mid-ranks ties, the same convention AUC uses
-  internally. Do not replace it with a threshold scan.
-- **Zero is data, not nodata.** The `.asc` grids carry no NODATA value. Edges
-  are uniformly zero (a domain mask) but so is ~88% of the interior, so zero
-  cannot be dropped.
-- **Class ratio varies by mechanism.** The absence set is fixed at 90 while
-  positives differ, so precision/F1/CSI are not comparable *across*
-  mechanisms. Recall is; specificity is identical by construction.
+Figures, data fetches and the build of Erkan's evaluation bundle. The scoring itself is the
+`landlab-grid-validation` package; the record of the validation is
+`Downloads/pioneer/VALIDATION_MASTER.md`. Run from the repo root.
 
 ---
 
@@ -110,10 +56,6 @@ pre-event DEM instead.
 | `make_cascade_slide.py` | slide 14: burn severity, Washington locators (flat + topographic), PRISM storm forcing, timeline |
 | `make_uav_layer_figures.py` | fig2 from the 10 m `.asc` layers, all values and > 0.01 |
 | `make_usgs_hazard_map.py` | official USGS basin hazard map (`pioneer/usgs_hazard_pio2024`), `--rain 16..40` |
-| `make_pooled_auc_figure.py` | AUC and ROC for all 89 initiations pooled (checked against `cellwise_metrics.csv`); also `roc_two_negative_sets`: that ROC next to the Strauch et al. (2018) absence cells from an `auc_runs/` run |
-
-Both scoring scripts now score a pooled class `All` (every initiation, type
-ignored) next to LS, Runoff and Firehose.
 
 ## `pioneer_auc.yaml` — scoring the layers against the points (updated 2026-10-20)
 
@@ -130,10 +72,11 @@ cd ~/landlab-grid-validation
 PYTHONPATH=src python -m landlab_grid_validation ~/DemDifferencing/experiments/bin/pioneer_auc.yaml
 ```
 
-Runs so far (made with the retired `superseded/auc_experiment.py`, which the package
-reproduces to four decimals): `no_G_rule` (the Strauch et al. 2018 protocol, main
-result), `G5-150_both_classes` and `G5-150_negatives_only` (sensitivity), and the
-same three under `auc_runs_peri/` with the domain clipped to the validation perimeter.
+The September sensitivity runs (`no_G_rule`, `G5-150_both_classes`,
+`G5-150_negatives_only`, and the same with the domain clipped to the validation
+perimeter) were deleted on 21 Oct 2026; their numbers are in
+`Downloads/pioneer/VALIDATION_MASTER.md`, and this config remakes any of them under a
+new `run_name`.
 
 ## dDEM correction test: NDVI and figures (added 2026-10-01)
 
@@ -161,16 +104,6 @@ python experiments/bin/make_ddem_correction_figures.py      # -> ddem_correction
 - `make_ddem_correction_figures.py`: `ndvi_maps.png` (six NDVI maps), `ndvi_scenes_<year>.png`
   (every scene, dropped ones in red), `slide_ndvi.png` and `slide_ddem.png` (16:9 slides).
 
-## `superseded/`
-
-Three earlier figure scripts, kept for provenance, not maintained:
-`make_publication_figures.py` (hillshade basemap), `make_satellite_figures.py`
-(first satellite version), `make_3d_figures.py` (first 3D version). All three
-are replaced by `make_final_figures.py`, which covers every extent and layer
-they did and fixes the skirt and colourbar-collision bugs.
-
----
-
 ## Standing caveats for anything produced here
 
 1. **The dDEM shares data lineage with the ground truth.** The initiation
@@ -188,28 +121,6 @@ they did and fixes the skirt and colourbar-collision bugs.
    no ground at all.
 5. Esri imagery predates the 2024 fire in places — a location basemap, not
    evidence of the scars.
-
-## Offline baseline maps with a 0.01 display cutoff
-
-`make_baseline_censored_figures.py` creates the matching regional and UAV-window
-baseline panels in `Downloads/pioneer/regional_comparison/figures/`:
-
-```bash
-python experiments/bin/make_baseline_censored_figures.py
-```
-
-Outputs are `baseline_regional_layers_2d_gt0p01.{png,pdf}` and
-`baseline_uav_window_2d_gt0p01.{png,pdf}`. PNGs are 300 dpi. The script uses
-the original baseline TIFFs in `Downloads/regional_baseline/regional_baseline/`
-and shows only reprojected probabilities >0.01, using the existing panel style.
-This is a display filter; it does not change model values or evaluation scores.
-
-The clean RGB basemaps are extracted from separate image objects in the existing
-summer comparison PDFs, with their PDF placement mapped back to the reference
-extents. No new imagery is fetched. This additional utility requires `pypdf`
-(already installed in the current base Python environment). A JSON manifest
-records source/model/output hashes and extents. Existing target filenames are
-protected from overwriting; pass a new `--output-dir` to make another copy.
 
 ## `inventory_dod_stats.py` — Eagle Creek inventory polygons vs the dDEM
 
